@@ -16,7 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 print("=== Video Render Worker (CPU) Starting ===")
 
 # Overlay files bundled with the worker
-SMOKE_OVERLAY = "/app/overlays/smoke_gray.mp4"
+# smoke_gray_loop.mp4 is a ping-pong (forward+reverse) version for seamless looping
+SMOKE_OVERLAY = "/app/overlays/smoke_gray_loop.mp4"
 EMBERS_OVERLAY = "/app/overlays/embers.mp4"
 
 # FFmpeg settings - optimized for 32 vCPU
@@ -29,11 +30,11 @@ def check_overlays():
     """Verify overlay files are present."""
     smoke_ok = os.path.exists(SMOKE_OVERLAY)
     embers_ok = os.path.exists(EMBERS_OVERLAY)
-    print(f"Overlay smoke_gray.mp4: {'✓' if smoke_ok else '✗'} {SMOKE_OVERLAY}")
+    print(f"Overlay smoke_gray_loop.mp4: {'✓' if smoke_ok else '✗'} {SMOKE_OVERLAY}")
     print(f"Overlay embers.mp4: {'✓' if embers_ok else '✗'} {EMBERS_OVERLAY}")
     if smoke_ok:
         smoke_size = os.path.getsize(SMOKE_OVERLAY)
-        print(f"  smoke_gray.mp4 size: {smoke_size / 1024:.1f} KB")
+        print(f"  smoke_gray_loop.mp4 size: {smoke_size / 1024:.1f} KB")
     if embers_ok:
         embers_size = os.path.getsize(EMBERS_OVERLAY)
         print(f"  embers.mp4 size: {embers_size / 1024:.1f} KB")
