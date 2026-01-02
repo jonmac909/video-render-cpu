@@ -250,6 +250,8 @@ def render_video_cpu(
                 raise Exception(f"Raw render failed: {error_output[-500:]}")
 
             # Pass 2: Apply smoke + embers overlay
+            # Note: flags=full_chroma_int+accurate_rnd prevents green tint from color conversion
+            # Grayscale coefficients: .3:.59:.11 (standard luminance weights for R, G, B)
             cmd_effects = [
                 'ffmpeg', '-y',
                 '-i', raw_video,
@@ -257,10 +259,11 @@ def render_video_cpu(
                 '-stream_loop', '-1', '-i', EMBERS_OVERLAY,
                 '-i', audio_path,
                 '-filter_complex',
-                '[1:v]colorchannelmixer=.3:.4:.3:0:.3:.4:.3:0:.3:.4:.3:0[smoke];'
-                '[0:v][smoke]blend=all_mode=multiply[with_smoke];'
-                '[2:v]colorkey=0x000000:0.2:0.2[embers];'
-                '[with_smoke][embers]overlay=shortest=1[out]',
+                '[0:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd[base];'
+                '[1:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd,colorchannelmixer=.3:.59:.11:0:.3:.59:.11:0:.3:.59:.11:0[smoke_gray];'
+                '[base][smoke_gray]blend=all_mode=multiply[with_smoke];'
+                '[2:v]scale=1920:1080,colorkey=black:similarity=0.2:blend=0.2[embers_keyed];'
+                '[with_smoke][embers_keyed]overlay=0:0:shortest=1[out]',
                 '-map', '[out]',
                 '-map', '3:a',
                 *encoder_args,
