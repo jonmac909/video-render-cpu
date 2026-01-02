@@ -20,10 +20,12 @@ print("=== Video Render Worker (CPU) Starting ===")
 SMOKE_OVERLAY = "/app/overlays/smoke_gray_loop.mp4"
 EMBERS_OVERLAY = "/app/overlays/embers.mp4"
 
-# FFmpeg settings - optimized for 32 vCPU
-FFMPEG_THREADS = 32  # Use all available cores
-FFMPEG_PRESET = "fast"  # Good speed/quality balance (options: ultrafast, superfast, veryfast, faster, fast, medium)
-FFMPEG_CRF = "24"  # Constant quality (lower = better, 18-28 typical)
+# FFmpeg settings - optimized for 32 vCPU with 64GB RAM
+FFMPEG_THREADS = 0  # 0 = auto-detect optimal thread count (recommended over hardcoding)
+FFMPEG_PRESET = "veryfast"  # Faster encoding with minimal quality loss (veryfast is ~2x faster than fast)
+FFMPEG_CRF = "23"  # Slightly better quality (23 is x264 default, visually lossless)
+FFMPEG_LOOKAHEAD = 50  # Frames to look ahead for better encoding decisions
+FFMPEG_THREAD_TYPE = "frame"  # Frame-level parallelism (best for many cores)
 
 # Check overlay files exist
 def check_overlays():
@@ -42,7 +44,9 @@ def check_overlays():
 
 # Run startup checks
 check_overlays()
-print(f"Encoder: libx264 (CPU) with {FFMPEG_THREADS} threads")
+cpu_count = os.cpu_count() or 32
+print(f"Encoder: libx264 (CPU) with auto threads ({cpu_count} cores detected)")
+print(f"Preset: {FFMPEG_PRESET}, CRF: {FFMPEG_CRF}, Thread type: {FFMPEG_THREAD_TYPE}")
 print("=== Worker Ready ===")
 print()
 
@@ -170,12 +174,14 @@ def create_concat_file(image_paths: list, timings: list) -> str:
 
 
 def get_encoder_args():
-    """Get libx264 encoder arguments optimized for 32 cores."""
+    """Get libx264 encoder arguments optimized for 32 cores with 64GB RAM."""
     return [
         '-c:v', 'libx264',
         '-preset', FFMPEG_PRESET,
         '-crf', FFMPEG_CRF,
-        '-threads', str(FFMPEG_THREADS)
+        '-threads', str(FFMPEG_THREADS),  # 0 = auto-detect
+        '-x264-params', f'threads=auto:lookahead_threads=auto:rc-lookahead={FFMPEG_LOOKAHEAD}',
+        '-thread_type', FFMPEG_THREAD_TYPE,  # frame-level parallelism
     ]
 
 
@@ -206,16 +212,19 @@ def render_video_cpu(
             # Two-pass approach: render raw, then apply effects
             raw_video = tempfile.mktemp(suffix='_raw.mp4')
 
+            cpu_cores = os.cpu_count() or 32
             cmd_raw = [
                 'ffmpeg', '-y',
                 '-f', 'concat', '-safe', '0', '-i', concat_file,
+                '-filter_threads', str(cpu_cores),  # Parallelize filter operations
+                '-filter_complex_threads', str(cpu_cores),  # For complex filter graphs
                 '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=24',
                 *encoder_args,
                 '-pix_fmt', 'yuv420p',
                 raw_video
             ]
 
-            print(f"Pass 1: Rendering raw video (libx264, {FFMPEG_THREADS} threads)...")
+            print(f"Pass 1: Rendering raw video (libx264, {cpu_cores} cores)...")
             send_progress("rendering", 25, "Pass 1: Rendering raw video...")
 
             process = subprocess.Popen(
@@ -259,6 +268,8 @@ def render_video_cpu(
                 '-stream_loop', '-1', '-i', SMOKE_OVERLAY,
                 '-stream_loop', '-1', '-i', EMBERS_OVERLAY,
                 '-i', audio_path,
+                '-filter_threads', str(cpu_cores),  # Parallelize filter operations
+                '-filter_complex_threads', str(cpu_cores),  # Critical for complex filter graphs
                 '-filter_complex',
                 '[0:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd[base];'
                 '[1:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd,colorchannelmixer=.3:.59:.11:0:.3:.59:.11:0:.3:.59:.11:0[smoke_gray];'
@@ -275,7 +286,7 @@ def render_video_cpu(
                 output_path
             ]
 
-            print(f"Pass 2: Applying effects (libx264, {FFMPEG_THREADS} threads)...")
+            print(f"Pass 2: Applying effects (libx264, {cpu_cores} cores)...")
             send_progress("rendering", 50, "Pass 2: Applying smoke + embers...")
 
             process = subprocess.Popen(
@@ -316,10 +327,12 @@ def render_video_cpu(
 
         else:
             # No effects - single pass with audio
+            cpu_cores = os.cpu_count() or 32
             cmd = [
                 'ffmpeg', '-y',
                 '-f', 'concat', '-safe', '0', '-i', concat_file,
                 '-i', audio_path,
+                '-filter_threads', str(cpu_cores),
                 '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=24',
                 *encoder_args,
                 '-pix_fmt', 'yuv420p',
@@ -329,7 +342,7 @@ def render_video_cpu(
                 output_path
             ]
 
-            print(f"Rendering video without effects (libx264, {FFMPEG_THREADS} threads)...")
+            print(f"Rendering video without effects (libx264, {cpu_cores} cores)...")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
             if result.returncode != 0:
                 raise Exception(f"Render failed: {result.stderr[-500:]}")
@@ -376,7 +389,8 @@ def handler(job):
         if not os.path.exists(SMOKE_OVERLAY) or not os.path.exists(EMBERS_OVERLAY):
             return {"error": "Overlay files missing - cannot apply effects"}
 
-    print(f"Starting video render: {len(image_urls)} images, effects={apply_effects}, encoder=libx264 ({FFMPEG_THREADS} threads)")
+    cpu_cores = os.cpu_count() or 32
+    print(f"Starting video render: {len(image_urls)} images, effects={apply_effects}, encoder=libx264 (preset={FFMPEG_PRESET}, {cpu_cores} cores)")
     start_time = time.time()
 
     last_supabase_update = [0]
