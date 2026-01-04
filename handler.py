@@ -457,14 +457,17 @@ def handler(job):
                             progress_callback=progress_callback)
 
             # Scrub FFmpeg metadata to prevent YouTube bot flagging
-            # YouTube flags videos with Lavf/Lavc muxer metadata as "Programmatic Mass Content"
+            # YouTube flags videos with:
+            # 1. Lavf/Lavc muxer metadata (container-level) -> removed by -map_metadata -1
+            # 2. x264 encoder string in SEI NAL units (stream-level) -> removed by filter_units
             update_render_job(supabase_url, supabase_key, render_job_id,
                               status="rendering", progress=86, message="Removing bot fingerprint metadata...")
             output_path = os.path.join(temp_dir, "output.mp4")
             scrub_cmd = [
                 'ffmpeg', '-y',
                 '-i', raw_output_path,
-                '-map_metadata', '-1',      # Strip ALL metadata
+                '-map_metadata', '-1',      # Strip ALL container metadata (removes Lavf muxer tag)
+                '-bsf:v', 'filter_units=remove_types=6',  # Remove SEI NAL units (x264 encoder string)
                 '-fflags', '+bitexact',     # Don't write FFmpeg version to container
                 '-flags:v', '+bitexact',    # Don't write encoder info to video stream
                 '-flags:a', '+bitexact',    # Don't write encoder info to audio stream
