@@ -452,9 +452,35 @@ def handler(job):
 
             update_render_job(supabase_url, supabase_key, render_job_id,
                               status="rendering", progress=25, message="Starting video render...")
-            output_path = os.path.join(temp_dir, "output.mp4")
-            render_video_cpu(image_paths, timings, audio_path, output_path, apply_effects,
+            raw_output_path = os.path.join(temp_dir, "output_raw.mp4")
+            render_video_cpu(image_paths, timings, audio_path, raw_output_path, apply_effects,
                             progress_callback=progress_callback)
+
+            # Scrub FFmpeg metadata to prevent YouTube bot flagging
+            # YouTube flags videos with Lavf/Lavc muxer metadata as "Programmatic Mass Content"
+            update_render_job(supabase_url, supabase_key, render_job_id,
+                              status="rendering", progress=86, message="Removing bot fingerprint metadata...")
+            output_path = os.path.join(temp_dir, "output.mp4")
+            scrub_cmd = [
+                'ffmpeg', '-y',
+                '-i', raw_output_path,
+                '-map_metadata', '-1',  # Strip ALL metadata (removes Lavf/Lavc fingerprint)
+                '-c:v', 'copy',         # Copy video stream without re-encoding
+                '-c:a', 'copy',         # Copy audio stream without re-encoding
+                '-movflags', '+faststart',  # Optimize for streaming
+                output_path
+            ]
+            print("Scrubbing FFmpeg metadata (instant remux)...")
+            scrub_result = subprocess.run(scrub_cmd, capture_output=True, text=True, timeout=120)
+            if scrub_result.returncode != 0:
+                print(f"Metadata scrub warning: {scrub_result.stderr[-200:]}")
+                # Fall back to raw output if scrub fails
+                output_path = raw_output_path
+            else:
+                print("Metadata stripped successfully")
+                # Clean up raw file
+                if os.path.exists(raw_output_path):
+                    os.remove(raw_output_path)
 
             update_render_job(supabase_url, supabase_key, render_job_id,
                               status="uploading", progress=88, message="Uploading video...")
