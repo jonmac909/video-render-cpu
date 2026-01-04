@@ -464,9 +464,12 @@ def handler(job):
             scrub_cmd = [
                 'ffmpeg', '-y',
                 '-i', raw_output_path,
-                '-map_metadata', '-1',  # Strip ALL metadata (removes Lavf/Lavc fingerprint)
-                '-c:v', 'copy',         # Copy video stream without re-encoding
-                '-c:a', 'copy',         # Copy audio stream without re-encoding
+                '-map_metadata', '-1',      # Strip ALL metadata
+                '-fflags', '+bitexact',     # Don't write FFmpeg version to container
+                '-flags:v', '+bitexact',    # Don't write encoder info to video stream
+                '-flags:a', '+bitexact',    # Don't write encoder info to audio stream
+                '-c:v', 'copy',             # Copy video stream without re-encoding
+                '-c:a', 'copy',             # Copy audio stream without re-encoding
                 '-movflags', '+faststart',  # Optimize for streaming
                 output_path
             ]
