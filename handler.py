@@ -185,20 +185,35 @@ def get_encoder_args():
     ]
 
 
+def get_chunk_duration(timings: list) -> float:
+    """Calculate total duration from timings (for chunk mode without audio)."""
+    if not timings:
+        return 0.0
+    return sum(t['endSeconds'] - t['startSeconds'] for t in timings)
+
+
 def render_video_cpu(
     image_paths: list,
     timings: list,
     audio_path: str,
     output_path: str,
     apply_effects: bool = True,
-    progress_callback=None
+    progress_callback=None,
+    chunk_mode: bool = False
 ) -> bool:
     """
     Render video using CPU (libx264) with 32 threads.
+    In chunk_mode, renders video-only (no audio) for later concatenation.
     """
     encoder_args = get_encoder_args()
-    total_duration = get_audio_duration(audio_path)
-    print(f"Total audio duration: {total_duration:.1f}s")
+
+    # In chunk mode, calculate duration from timings (no audio file)
+    if chunk_mode:
+        total_duration = get_chunk_duration(timings)
+        print(f"Chunk duration (from timings): {total_duration:.1f}s")
+    else:
+        total_duration = get_audio_duration(audio_path)
+        print(f"Total audio duration: {total_duration:.1f}s")
 
     def send_progress(stage: str, percent: float, message: str):
         if progress_callback:
@@ -262,29 +277,51 @@ def render_video_cpu(
             # Pass 2: Apply smoke + embers overlay
             # Note: flags=full_chroma_int+accurate_rnd prevents green tint from color conversion
             # Grayscale coefficients: .3:.59:.11 (standard luminance weights for R, G, B)
-            cmd_effects = [
-                'ffmpeg', '-y',
-                '-i', raw_video,
-                '-stream_loop', '-1', '-i', SMOKE_OVERLAY,
-                '-stream_loop', '-1', '-i', EMBERS_OVERLAY,
-                '-i', audio_path,
-                '-filter_threads', str(cpu_cores),  # Parallelize filter operations
-                '-filter_complex_threads', str(cpu_cores),  # Critical for complex filter graphs
-                '-filter_complex',
-                '[0:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd[base];'
-                '[1:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd,colorchannelmixer=.3:.59:.11:0:.3:.59:.11:0:.3:.59:.11:0[smoke_gray];'
-                '[base][smoke_gray]blend=all_mode=multiply[with_smoke];'
-                '[2:v]scale=1920:1080,colorkey=black:similarity=0.2:blend=0.2[embers_keyed];'
-                '[with_smoke][embers_keyed]overlay=0:0:shortest=1[out]',
-                '-map', '[out]',
-                '-map', '3:a',
-                *encoder_args,
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-shortest',
-                output_path
-            ]
+            if chunk_mode:
+                # Chunk mode: video only, no audio
+                cmd_effects = [
+                    'ffmpeg', '-y',
+                    '-i', raw_video,
+                    '-stream_loop', '-1', '-i', SMOKE_OVERLAY,
+                    '-stream_loop', '-1', '-i', EMBERS_OVERLAY,
+                    '-filter_threads', str(cpu_cores),
+                    '-filter_complex_threads', str(cpu_cores),
+                    '-filter_complex',
+                    '[0:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd[base];'
+                    '[1:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd,colorchannelmixer=.3:.59:.11:0:.3:.59:.11:0:.3:.59:.11:0[smoke_gray];'
+                    '[base][smoke_gray]blend=all_mode=multiply[with_smoke];'
+                    '[2:v]scale=1920:1080,colorkey=black:similarity=0.2:blend=0.2[embers_keyed];'
+                    '[with_smoke][embers_keyed]overlay=0:0:shortest=1[out]',
+                    '-map', '[out]',
+                    *encoder_args,
+                    '-pix_fmt', 'yuv420p',
+                    output_path
+                ]
+            else:
+                # Full mode: video + audio
+                cmd_effects = [
+                    'ffmpeg', '-y',
+                    '-i', raw_video,
+                    '-stream_loop', '-1', '-i', SMOKE_OVERLAY,
+                    '-stream_loop', '-1', '-i', EMBERS_OVERLAY,
+                    '-i', audio_path,
+                    '-filter_threads', str(cpu_cores),
+                    '-filter_complex_threads', str(cpu_cores),
+                    '-filter_complex',
+                    '[0:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd[base];'
+                    '[1:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd,colorchannelmixer=.3:.59:.11:0:.3:.59:.11:0:.3:.59:.11:0[smoke_gray];'
+                    '[base][smoke_gray]blend=all_mode=multiply[with_smoke];'
+                    '[2:v]scale=1920:1080,colorkey=black:similarity=0.2:blend=0.2[embers_keyed];'
+                    '[with_smoke][embers_keyed]overlay=0:0:shortest=1[out]',
+                    '-map', '[out]',
+                    '-map', '3:a',
+                    *encoder_args,
+                    '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac',
+                    '-b:a', '192k',
+                    '-shortest',
+                    output_path
+                ]
 
             print(f"Pass 2: Applying effects (libx264, {cpu_cores} cores)...")
             send_progress("rendering", 50, "Pass 2: Applying smoke + embers...")
@@ -326,21 +363,34 @@ def render_video_cpu(
                 raise Exception(f"Effects render failed: {error_output[-500:]}")
 
         else:
-            # No effects - single pass with audio
+            # No effects - single pass
             cpu_cores = os.cpu_count() or 32
-            cmd = [
-                'ffmpeg', '-y',
-                '-f', 'concat', '-safe', '0', '-i', concat_file,
-                '-i', audio_path,
-                '-filter_threads', str(cpu_cores),
-                '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=24',
-                *encoder_args,
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-shortest',
-                output_path
-            ]
+            if chunk_mode:
+                # Chunk mode: video only, no audio
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-f', 'concat', '-safe', '0', '-i', concat_file,
+                    '-filter_threads', str(cpu_cores),
+                    '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=24',
+                    *encoder_args,
+                    '-pix_fmt', 'yuv420p',
+                    output_path
+                ]
+            else:
+                # Full mode: video + audio
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-f', 'concat', '-safe', '0', '-i', concat_file,
+                    '-i', audio_path,
+                    '-filter_threads', str(cpu_cores),
+                    '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=24',
+                    *encoder_args,
+                    '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac',
+                    '-b:a', '192k',
+                    '-shortest',
+                    output_path
+                ]
 
             print(f"Rendering video without effects (libx264, {cpu_cores} cores)...")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
@@ -363,7 +413,16 @@ def render_video_cpu(
 
 def handler(job):
     """RunPod handler for video rendering (CPU version)."""
-    job_input = job["input"]
+    print(f"=== Handler invoked ===")
+    print(f"Job keys: {list(job.keys())}")
+    try:
+        job_input = job.get("input", {})
+        print(f"Input keys: {list(job_input.keys())}")
+        print(f"chunk_mode: {job_input.get('chunk_mode')}")
+        print(f"image_urls count: {len(job_input.get('image_urls', []))}")
+    except Exception as e:
+        print(f"Input parsing error: {e}")
+        return {"error": f"Input parsing failed: {str(e)}"}
 
     image_urls = job_input.get("image_urls", [])
     timings = job_input.get("timings", [])
@@ -374,10 +433,15 @@ def handler(job):
     supabase_key = job_input.get("supabase_key")
     render_job_id = job_input.get("render_job_id")
 
+    # Chunk mode parameters for parallel rendering
+    chunk_mode = job_input.get("chunk_mode", False)
+    chunk_index = job_input.get("chunk_index", 0)
+    total_chunks = job_input.get("total_chunks", 1)
+
     if not image_urls:
         return {"error": "No image URLs provided"}
-    if not audio_url:
-        return {"error": "No audio URL provided"}
+    if not chunk_mode and not audio_url:
+        return {"error": "No audio URL provided (required in non-chunk mode)"}
     if not project_id:
         return {"error": "No project ID provided"}
     if not supabase_url or not supabase_key:
@@ -390,7 +454,10 @@ def handler(job):
             return {"error": "Overlay files missing - cannot apply effects"}
 
     cpu_cores = os.cpu_count() or 32
-    print(f"Starting video render: {len(image_urls)} images, effects={apply_effects}, encoder=libx264 (preset={FFMPEG_PRESET}, {cpu_cores} cores)")
+    if chunk_mode:
+        print(f"Starting CHUNK render: chunk {chunk_index + 1}/{total_chunks}, {len(image_urls)} images, effects={apply_effects}")
+    else:
+        print(f"Starting video render: {len(image_urls)} images, effects={apply_effects}, encoder=libx264 (preset={FFMPEG_PRESET}, {cpu_cores} cores)")
     start_time = time.time()
 
     last_supabase_update = [0]
@@ -444,76 +511,104 @@ def handler(job):
             download_elapsed = time.time() - download_start
             print(f"Downloaded {len(image_paths)} images in {download_elapsed:.1f}s")
 
-            update_render_job(supabase_url, supabase_key, render_job_id,
-                              status="downloading", progress=22, message="Downloading audio...")
-            audio_path = os.path.join(temp_dir, "audio.wav")
-            if not download_file(audio_url, audio_path, timeout=300):
-                return {"error": "Failed to download audio"}
+            # In chunk mode, skip audio download
+            audio_path = None
+            if not chunk_mode:
+                update_render_job(supabase_url, supabase_key, render_job_id,
+                                  status="downloading", progress=22, message="Downloading audio...")
+                audio_path = os.path.join(temp_dir, "audio.wav")
+                if not download_file(audio_url, audio_path, timeout=300):
+                    return {"error": "Failed to download audio"}
 
             update_render_job(supabase_url, supabase_key, render_job_id,
-                              status="rendering", progress=25, message="Starting video render...")
+                              status="rendering", progress=25,
+                              message=f"{'Chunk ' + str(chunk_index + 1) + ': ' if chunk_mode else ''}Starting video render...")
             raw_output_path = os.path.join(temp_dir, "output_raw.mp4")
             render_video_cpu(image_paths, timings, audio_path, raw_output_path, apply_effects,
-                            progress_callback=progress_callback)
+                            progress_callback=progress_callback, chunk_mode=chunk_mode)
 
-            # Scrub FFmpeg metadata to prevent YouTube bot flagging
-            # YouTube flags videos with:
-            # 1. Lavf/Lavc muxer metadata (container-level) -> removed by -map_metadata -1
-            # 2. x264 encoder string in SEI NAL units (stream-level) -> removed by filter_units
-            update_render_job(supabase_url, supabase_key, render_job_id,
-                              status="rendering", progress=86, message="Removing bot fingerprint metadata...")
-            output_path = os.path.join(temp_dir, "output.mp4")
-            scrub_cmd = [
-                'ffmpeg', '-y',
-                '-i', raw_output_path,
-                '-map_metadata', '-1',      # Strip ALL container metadata (removes Lavf muxer tag)
-                '-bsf:v', 'filter_units=remove_types=6',  # Remove SEI NAL units (x264 encoder string)
-                '-fflags', '+bitexact',     # Don't write FFmpeg version to container
-                '-flags:v', '+bitexact',    # Don't write encoder info to video stream
-                '-flags:a', '+bitexact',    # Don't write encoder info to audio stream
-                '-c:v', 'copy',             # Copy video stream without re-encoding
-                '-c:a', 'copy',             # Copy audio stream without re-encoding
-                '-movflags', '+faststart',  # Optimize for streaming
-                output_path
-            ]
-            print("Scrubbing FFmpeg metadata (instant remux)...")
-            scrub_result = subprocess.run(scrub_cmd, capture_output=True, text=True, timeout=120)
-            if scrub_result.returncode != 0:
-                print(f"Metadata scrub warning: {scrub_result.stderr[-200:]}")
-                # Fall back to raw output if scrub fails
+            if chunk_mode:
+                # Chunk mode: skip metadata scrub (will do on final concatenated video)
+                # Upload directly to chunks subfolder
                 output_path = raw_output_path
+                update_render_job(supabase_url, supabase_key, render_job_id,
+                                  status="uploading", progress=88,
+                                  message=f"Chunk {chunk_index + 1}: Uploading...")
+                storage_path = f"{project_id}/chunks/chunk_{chunk_index:02d}.mp4"
+                video_url = upload_to_supabase(
+                    output_path,
+                    "generated-assets",
+                    storage_path,
+                    supabase_url,
+                    supabase_key
+                )
+
+                elapsed = time.time() - start_time
+                print(f"Chunk {chunk_index + 1} complete in {elapsed:.1f}s")
+
+                # Don't update render_job status to complete in chunk mode
+                # (the orchestrator will track chunk completion separately)
+                return {
+                    "chunk_url": video_url,
+                    "chunk_index": chunk_index,
+                    "render_time_seconds": elapsed
+                }
+
             else:
-                print("Metadata stripped successfully")
-                # Clean up raw file
-                if os.path.exists(raw_output_path):
-                    os.remove(raw_output_path)
+                # Full mode: scrub metadata and upload final video
+                # Scrub FFmpeg metadata to prevent YouTube bot flagging
+                update_render_job(supabase_url, supabase_key, render_job_id,
+                                  status="rendering", progress=86, message="Removing bot fingerprint metadata...")
+                output_path = os.path.join(temp_dir, "output.mp4")
+                scrub_cmd = [
+                    'ffmpeg', '-y',
+                    '-i', raw_output_path,
+                    '-map_metadata', '-1',
+                    '-bsf:v', 'filter_units=remove_types=6',
+                    '-fflags', '+bitexact',
+                    '-flags:v', '+bitexact',
+                    '-flags:a', '+bitexact',
+                    '-c:v', 'copy',
+                    '-c:a', 'copy',
+                    '-movflags', '+faststart',
+                    output_path
+                ]
+                print("Scrubbing FFmpeg metadata (instant remux)...")
+                scrub_result = subprocess.run(scrub_cmd, capture_output=True, text=True, timeout=120)
+                if scrub_result.returncode != 0:
+                    print(f"Metadata scrub warning: {scrub_result.stderr[-200:]}")
+                    output_path = raw_output_path
+                else:
+                    print("Metadata stripped successfully")
+                    if os.path.exists(raw_output_path):
+                        os.remove(raw_output_path)
 
-            update_render_job(supabase_url, supabase_key, render_job_id,
-                              status="uploading", progress=88, message="Uploading video...")
-            storage_path = f"{project_id}/video.mp4"
-            video_url = upload_to_supabase(
-                output_path,
-                "generated-assets",
-                storage_path,
-                supabase_url,
-                supabase_key
-            )
+                update_render_job(supabase_url, supabase_key, render_job_id,
+                                  status="uploading", progress=88, message="Uploading video...")
+                storage_path = f"{project_id}/video.mp4"
+                video_url = upload_to_supabase(
+                    output_path,
+                    "generated-assets",
+                    storage_path,
+                    supabase_url,
+                    supabase_key
+                )
 
-            elapsed = time.time() - start_time
-            print(f"Total time: {elapsed:.1f}s")
+                elapsed = time.time() - start_time
+                print(f"Total time: {elapsed:.1f}s")
 
-            update_render_job(
-                supabase_url, supabase_key, render_job_id,
-                status="complete",
-                progress=100,
-                message=f"Video rendered successfully (CPU: {elapsed:.1f}s)",
-                video_url=video_url
-            )
+                update_render_job(
+                    supabase_url, supabase_key, render_job_id,
+                    status="complete",
+                    progress=100,
+                    message=f"Video rendered successfully (CPU: {elapsed:.1f}s)",
+                    video_url=video_url
+                )
 
-            return {
-                "video_url": video_url,
-                "render_time_seconds": elapsed
-            }
+                return {
+                    "video_url": video_url,
+                    "render_time_seconds": elapsed
+                }
 
     except Exception as e:
         print(f"Handler error: {e}")
