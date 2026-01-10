@@ -598,6 +598,8 @@ def handler(job):
 
     # Handle finalize mode separately (different workflow)
     if finalize_mode:
+        print(f"FINALIZE MODE: chunk_urls={len(chunk_urls)}, audio_url={bool(audio_url)}, project_id={project_id}")
+        print(f"FINALIZE MODE: supabase_url={bool(supabase_url)}, supabase_key={bool(supabase_key)}, render_job_id={render_job_id}")
         if not chunk_urls:
             return {"error": "No chunk URLs provided for finalize mode"}
         if not audio_url:
@@ -606,6 +608,8 @@ def handler(job):
             return {"error": "No project ID provided"}
         if not supabase_url or not supabase_key:
             return {"error": "Supabase credentials required"}
+        if not render_job_id:
+            return {"error": "No render_job_id provided for finalize mode"}
 
         cpu_cores = os.cpu_count() or 32
         print(f"Starting FINALIZE mode: {len(chunk_urls)} chunks, audio encoding with {cpu_cores} cores")
