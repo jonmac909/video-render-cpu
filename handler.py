@@ -279,6 +279,8 @@ def render_video_cpu(
             # Grayscale coefficients: .3:.59:.11 (standard luminance weights for R, G, B)
             if chunk_mode:
                 # Chunk mode: video only, no audio
+                # CRITICAL: Use shortest=1 on blend filter to prevent infinite looping
+                # (smoke/embers overlays are -stream_loop -1, so blend must limit to base video duration)
                 cmd_effects = [
                     'ffmpeg', '-y',
                     '-i', raw_video,
@@ -289,7 +291,7 @@ def render_video_cpu(
                     '-filter_complex',
                     '[0:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd[base];'
                     '[1:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd,colorchannelmixer=.3:.59:.11:0:.3:.59:.11:0:.3:.59:.11:0[smoke_gray];'
-                    '[base][smoke_gray]blend=all_mode=multiply[with_smoke];'
+                    '[base][smoke_gray]blend=all_mode=multiply:shortest=1[with_smoke];'
                     '[2:v]scale=1920:1080,colorkey=black:similarity=0.2:blend=0.2[embers_keyed];'
                     '[with_smoke][embers_keyed]overlay=0:0:shortest=1[out]',
                     '-map', '[out]',
@@ -462,6 +464,11 @@ def handler(job):
 
     last_supabase_update = [0]
     def progress_callback(stage: str, percent: float, message: str):
+        # In chunk mode, DON'T update the render_job table with progress
+        # This prevents race conditions where all 10 workers update the same job
+        # The orchestrator tracks chunk completion instead
+        if chunk_mode:
+            return
         now = time.time()
         if now - last_supabase_update[0] >= 2:
             last_supabase_update[0] = now
@@ -474,8 +481,10 @@ def handler(job):
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            update_render_job(supabase_url, supabase_key, render_job_id,
-                              status="downloading", progress=5, message="Downloading assets...")
+            # Only update job status in non-chunk mode (orchestrator handles chunk progress)
+            if not chunk_mode:
+                update_render_job(supabase_url, supabase_key, render_job_id,
+                                  status="downloading", progress=5, message="Downloading assets...")
 
             download_start = time.time()
             image_paths = [None] * len(image_urls)
@@ -499,7 +508,7 @@ def handler(job):
                     else:
                         failed_downloads.append(i)
                     completed_count += 1
-                    if completed_count % 10 == 0:
+                    if completed_count % 10 == 0 and not chunk_mode:
                         dl_pct = 5 + int((completed_count / len(image_urls)) * 15)
                         update_render_job(supabase_url, supabase_key, render_job_id,
                                           status="downloading", progress=dl_pct,
@@ -519,10 +528,12 @@ def handler(job):
                 audio_path = os.path.join(temp_dir, "audio.wav")
                 if not download_file(audio_url, audio_path, timeout=300):
                     return {"error": "Failed to download audio"}
-
-            update_render_job(supabase_url, supabase_key, render_job_id,
-                              status="rendering", progress=25,
-                              message=f"{'Chunk ' + str(chunk_index + 1) + ': ' if chunk_mode else ''}Starting video render...")
+                update_render_job(supabase_url, supabase_key, render_job_id,
+                                  status="rendering", progress=25,
+                                  message="Starting video render...")
+            else:
+                # In chunk mode, just print to logs (orchestrator tracks progress)
+                print(f"Chunk {chunk_index + 1}: Starting video render...")
             raw_output_path = os.path.join(temp_dir, "output_raw.mp4")
             render_video_cpu(image_paths, timings, audio_path, raw_output_path, apply_effects,
                             progress_callback=progress_callback, chunk_mode=chunk_mode)
@@ -531,9 +542,8 @@ def handler(job):
                 # Chunk mode: skip metadata scrub (will do on final concatenated video)
                 # Upload directly to chunks subfolder
                 output_path = raw_output_path
-                update_render_job(supabase_url, supabase_key, render_job_id,
-                                  status="uploading", progress=88,
-                                  message=f"Chunk {chunk_index + 1}: Uploading...")
+                # Don't update Supabase status in chunk mode - just log
+                print(f"Chunk {chunk_index + 1}: Uploading to storage...")
                 storage_path = f"{project_id}/chunks/chunk_{chunk_index:02d}.mp4"
                 video_url = upload_to_supabase(
                     output_path,
@@ -612,13 +622,16 @@ def handler(job):
 
     except Exception as e:
         print(f"Handler error: {e}")
-        update_render_job(
-            supabase_url, supabase_key, render_job_id,
-            status="failed",
-            progress=0,
-            message="CPU render failed",
-            error=str(e)
-        )
+        # In chunk mode, don't update Supabase - orchestrator handles failure tracking
+        # Each chunk's error is reported via RunPod output
+        if not chunk_mode:
+            update_render_job(
+                supabase_url, supabase_key, render_job_id,
+                status="failed",
+                progress=0,
+                message="CPU render failed",
+                error=str(e)
+            )
         return {"error": str(e)}
 
 
