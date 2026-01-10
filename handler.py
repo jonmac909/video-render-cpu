@@ -413,6 +413,157 @@ def render_video_cpu(
         raise
 
 
+def finalize_video(
+    chunk_urls: list,
+    audio_url: str,
+    output_path: str,
+    temp_dir: str,
+    progress_callback=None
+) -> bool:
+    """
+    Finalize video by concatenating chunks and muxing audio.
+    This runs on RunPod to leverage 32 cores for audio encoding.
+    """
+    cpu_cores = os.cpu_count() or 32
+
+    def send_progress(percent: float, message: str):
+        if progress_callback:
+            progress_callback("finalizing", percent, message)
+        print(f"[finalize] {percent:.0f}% - {message}")
+
+    send_progress(5, "Downloading video chunks...")
+
+    # Download all chunks in parallel
+    chunk_paths = []
+    failed_chunks = []
+
+    def download_chunk(args):
+        i, url = args
+        chunk_path = os.path.join(temp_dir, f"chunk_{i:02d}.mp4")
+        success = download_file(url, chunk_path, timeout=300)
+        return i, chunk_path, success
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(download_chunk, (i, url)): i
+                   for i, url in enumerate(chunk_urls)}
+        for future in as_completed(futures):
+            i, chunk_path, success = future.result()
+            if success:
+                chunk_paths.append((i, chunk_path))
+            else:
+                failed_chunks.append(i)
+
+    if failed_chunks:
+        raise Exception(f"Failed to download chunks: {failed_chunks}")
+
+    # Sort by index to maintain order
+    chunk_paths.sort(key=lambda x: x[0])
+    chunk_paths = [p for _, p in chunk_paths]
+
+    send_progress(25, "Downloading audio...")
+
+    # Download audio WAV
+    audio_path = os.path.join(temp_dir, "audio.wav")
+    if not download_file(audio_url, audio_path, timeout=600):
+        raise Exception("Failed to download audio")
+
+    audio_duration = get_audio_duration(audio_path)
+    print(f"Audio duration: {audio_duration:.1f}s")
+
+    send_progress(35, f"Encoding audio with {cpu_cores} cores...")
+
+    # Encode WAV to AAC (fast with 32 cores)
+    audio_aac_path = os.path.join(temp_dir, "audio.m4a")
+    encode_cmd = [
+        'ffmpeg', '-y',
+        '-i', audio_path,
+        '-c:a', 'aac',
+        '-ar', '48000',
+        '-b:a', '192k',
+        '-threads', '0',
+        audio_aac_path
+    ]
+
+    print(f"Encoding audio: {' '.join(encode_cmd[:8])}...")
+    process = subprocess.Popen(
+        encode_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+
+    last_pct = 0
+    for line in process.stdout:
+        if 'time=' in line and audio_duration > 0:
+            pct = parse_ffmpeg_progress(line, audio_duration)
+            if pct > last_pct + 10:
+                last_pct = pct
+                send_progress(35 + pct * 0.15, f"Encoding audio... {pct:.0f}%")
+
+    process.wait(timeout=1800)  # 30 min timeout for audio
+    if process.returncode != 0:
+        raise Exception("Audio encoding failed")
+
+    print("Audio encoded to AAC")
+
+    send_progress(50, "Concatenating video chunks...")
+
+    # Create concat file
+    concat_file = os.path.join(temp_dir, "chunks.txt")
+    with open(concat_file, 'w') as f:
+        for chunk_path in chunk_paths:
+            f.write(f"file '{chunk_path}'\n")
+
+    # Concatenate chunks (stream copy - instant)
+    concat_path = os.path.join(temp_dir, "concatenated.mp4")
+    concat_cmd = [
+        'ffmpeg', '-y',
+        '-f', 'concat', '-safe', '0',
+        '-i', concat_file,
+        '-c', 'copy',
+        concat_path
+    ]
+
+    print("Concatenating chunks (stream copy)...")
+    result = subprocess.run(concat_cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        raise Exception(f"Concat failed: {result.stderr[-500:]}")
+
+    send_progress(60, "Muxing audio with video...")
+
+    # Mux audio with video (stream copy - instant)
+    mux_cmd = [
+        'ffmpeg', '-y',
+        '-i', concat_path,
+        '-i', audio_aac_path,
+        '-c:v', 'copy',
+        '-c:a', 'copy',
+        '-shortest',
+        '-movflags', '+faststart',
+        output_path
+    ]
+
+    print("Muxing audio (stream copy)...")
+    result = subprocess.run(mux_cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        raise Exception(f"Mux failed: {result.stderr[-500:]}")
+
+    # Cleanup intermediate files
+    for chunk_path in chunk_paths:
+        if os.path.exists(chunk_path):
+            os.remove(chunk_path)
+    if os.path.exists(audio_path):
+        os.remove(audio_path)
+    if os.path.exists(audio_aac_path):
+        os.remove(audio_aac_path)
+    if os.path.exists(concat_path):
+        os.remove(concat_path)
+
+    output_size = os.path.getsize(output_path)
+    print(f"Finalize complete: {output_path} ({output_size / 1024 / 1024:.1f} MB)")
+    return True
+
+
 def handler(job):
     """RunPod handler for video rendering (CPU version)."""
     print(f"=== Handler invoked ===")
@@ -421,6 +572,7 @@ def handler(job):
         job_input = job.get("input", {})
         print(f"Input keys: {list(job_input.keys())}")
         print(f"chunk_mode: {job_input.get('chunk_mode')}")
+        print(f"finalize_mode: {job_input.get('finalize_mode')}")
         print(f"image_urls count: {len(job_input.get('image_urls', []))}")
     except Exception as e:
         print(f"Input parsing error: {e}")
@@ -440,6 +592,113 @@ def handler(job):
     chunk_index = job_input.get("chunk_index", 0)
     total_chunks = job_input.get("total_chunks", 1)
 
+    # Finalize mode: concatenate chunks + encode audio + mux (all on RunPod)
+    finalize_mode = job_input.get("finalize_mode", False)
+    chunk_urls = job_input.get("chunk_urls", [])
+
+    # Handle finalize mode separately (different workflow)
+    if finalize_mode:
+        if not chunk_urls:
+            return {"error": "No chunk URLs provided for finalize mode"}
+        if not audio_url:
+            return {"error": "No audio URL provided for finalize mode"}
+        if not project_id:
+            return {"error": "No project ID provided"}
+        if not supabase_url or not supabase_key:
+            return {"error": "Supabase credentials required"}
+
+        cpu_cores = os.cpu_count() or 32
+        print(f"Starting FINALIZE mode: {len(chunk_urls)} chunks, audio encoding with {cpu_cores} cores")
+        start_time = time.time()
+
+        last_supabase_update = [0]
+        def finalize_progress_callback(stage: str, percent: float, message: str):
+            now = time.time()
+            if now - last_supabase_update[0] >= 2:
+                last_supabase_update[0] = now
+                # Map finalize progress to 76-95% range (where muxing phase lives)
+                mapped_pct = 76 + int(percent * 0.19)
+                update_render_job(
+                    supabase_url, supabase_key, render_job_id,
+                    status="muxing",
+                    progress=mapped_pct,
+                    message=message
+                )
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                update_render_job(supabase_url, supabase_key, render_job_id,
+                                  status="muxing", progress=76, message="Finalizing: downloading chunks...")
+
+                output_path = os.path.join(temp_dir, "output_raw.mp4")
+                finalize_video(chunk_urls, audio_url, output_path, temp_dir,
+                              progress_callback=finalize_progress_callback)
+
+                # Scrub metadata
+                update_render_job(supabase_url, supabase_key, render_job_id,
+                                  status="muxing", progress=95, message="Removing bot fingerprint metadata...")
+                final_path = os.path.join(temp_dir, "output.mp4")
+                scrub_cmd = [
+                    'ffmpeg', '-y',
+                    '-i', output_path,
+                    '-map_metadata', '-1',
+                    '-bsf:v', 'filter_units=remove_types=6',
+                    '-fflags', '+bitexact',
+                    '-flags:v', '+bitexact',
+                    '-flags:a', '+bitexact',
+                    '-c:v', 'copy',
+                    '-c:a', 'copy',
+                    '-movflags', '+faststart',
+                    final_path
+                ]
+                print("Scrubbing metadata...")
+                scrub_result = subprocess.run(scrub_cmd, capture_output=True, text=True, timeout=120)
+                if scrub_result.returncode != 0:
+                    print(f"Metadata scrub warning: {scrub_result.stderr[-200:]}")
+                    final_path = output_path
+                else:
+                    print("Metadata stripped successfully")
+
+                # Upload final video
+                update_render_job(supabase_url, supabase_key, render_job_id,
+                                  status="uploading", progress=97, message="Uploading final video...")
+                storage_path = f"{project_id}/video.mp4"
+                video_url = upload_to_supabase(
+                    final_path,
+                    "generated-assets",
+                    storage_path,
+                    supabase_url,
+                    supabase_key
+                )
+
+                elapsed = time.time() - start_time
+                print(f"Finalize total time: {elapsed:.1f}s")
+
+                update_render_job(
+                    supabase_url, supabase_key, render_job_id,
+                    status="complete",
+                    progress=100,
+                    message=f"Video finalized successfully ({elapsed:.1f}s)",
+                    video_url=video_url
+                )
+
+                return {
+                    "video_url": video_url,
+                    "finalize_time_seconds": elapsed
+                }
+
+        except Exception as e:
+            print(f"Finalize error: {e}")
+            update_render_job(
+                supabase_url, supabase_key, render_job_id,
+                status="failed",
+                progress=0,
+                message="Finalize failed",
+                error=str(e)
+            )
+            return {"error": str(e)}
+
+    # Regular render mode validation
     if not image_urls:
         return {"error": "No image URLs provided"}
     if not chunk_mode and not audio_url:
