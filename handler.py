@@ -192,6 +192,44 @@ def get_chunk_duration(timings: list) -> float:
     return sum(t['endSeconds'] - t['startSeconds'] for t in timings)
 
 
+def apply_effects_to_video(input_path: str, output_path: str) -> bool:
+    """
+    Apply smoke + embers overlay effects to a video file.
+    Used for applying effects to intro clips.
+    """
+    cpu_cores = os.cpu_count() or 32
+    encoder_args = get_encoder_args()
+
+    print(f"Applying effects to: {input_path}")
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', input_path,
+        '-stream_loop', '-1', '-i', SMOKE_OVERLAY,
+        '-stream_loop', '-1', '-i', EMBERS_OVERLAY,
+        '-filter_threads', str(cpu_cores),
+        '-filter_complex_threads', str(cpu_cores),
+        '-filter_complex',
+        '[0:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd[base];'
+        '[1:v]scale=1920:1080:flags=full_chroma_int+accurate_rnd,colorchannelmixer=.3:.59:.11:0:.3:.59:.11:0:.3:.59:.11:0[smoke_gray];'
+        '[base][smoke_gray]blend=all_mode=multiply:shortest=1[with_smoke];'
+        '[2:v]scale=1920:1080,colorkey=black:similarity=0.2:blend=0.2[embers_keyed];'
+        '[with_smoke][embers_keyed]overlay=0:0:shortest=1[out]',
+        '-map', '[out]',
+        *encoder_args,
+        '-pix_fmt', 'yuv420p',
+        '-an',  # No audio for intro clips
+        output_path
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        print(f"Effects application failed: {result.stderr[-500:]}")
+        return False
+
+    print(f"Effects applied: {output_path}")
+    return True
+
+
 def render_video_cpu(
     image_paths: list,
     timings: list,
@@ -418,18 +456,51 @@ def finalize_video(
     audio_url: str,
     output_path: str,
     temp_dir: str,
-    progress_callback=None
+    progress_callback=None,
+    intro_clips: list = None,
+    apply_effects: bool = True
 ) -> bool:
     """
     Finalize video by concatenating chunks and muxing audio.
+    Optionally prepends intro clips with effects applied.
     This runs on RunPod to leverage 32 cores for audio encoding.
     """
     cpu_cores = os.cpu_count() or 32
+    intro_clips = intro_clips or []
 
     def send_progress(percent: float, message: str):
         if progress_callback:
             progress_callback("finalizing", percent, message)
         print(f"[finalize] {percent:.0f}% - {message}")
+
+    # Process intro clips if provided
+    intro_clip_paths = []
+    if intro_clips and apply_effects:
+        send_progress(2, f"Processing {len(intro_clips)} intro clips with effects...")
+        for i, clip in enumerate(intro_clips):
+            clip_url = clip.get('url') if isinstance(clip, dict) else clip
+            if not clip_url:
+                continue
+
+            raw_clip_path = os.path.join(temp_dir, f"intro_raw_{i:02d}.mp4")
+            effected_clip_path = os.path.join(temp_dir, f"intro_effected_{i:02d}.mp4")
+
+            print(f"Downloading intro clip {i + 1}/{len(intro_clips)}: {clip_url}")
+            if not download_file(clip_url, raw_clip_path, timeout=120):
+                print(f"Failed to download intro clip {i}, skipping")
+                continue
+
+            # Apply smoke + embers effects
+            if apply_effects_to_video(raw_clip_path, effected_clip_path):
+                intro_clip_paths.append(effected_clip_path)
+                os.remove(raw_clip_path)  # Clean up raw clip
+            else:
+                print(f"Failed to apply effects to intro clip {i}, using raw")
+                intro_clip_paths.append(raw_clip_path)
+
+            send_progress(2 + (i + 1) / len(intro_clips) * 3, f"Processed intro clip {i + 1}/{len(intro_clips)}")
+
+        print(f"Processed {len(intro_clip_paths)} intro clips")
 
     send_progress(5, "Downloading video chunks...")
 
@@ -508,11 +579,18 @@ def finalize_video(
 
     send_progress(50, "Concatenating video chunks...")
 
-    # Create concat file
+    # Create concat file (intro clips first, then image chunks)
     concat_file = os.path.join(temp_dir, "chunks.txt")
     with open(concat_file, 'w') as f:
+        # Add intro clips first (already have effects applied)
+        for intro_path in intro_clip_paths:
+            f.write(f"file '{intro_path}'\n")
+        # Then add image-based chunks
         for chunk_path in chunk_paths:
             f.write(f"file '{chunk_path}'\n")
+
+    total_clips = len(intro_clip_paths) + len(chunk_paths)
+    print(f"Concatenating {total_clips} clips ({len(intro_clip_paths)} intro + {len(chunk_paths)} image chunks)...")
 
     # Concatenate chunks (stream copy - instant)
     concat_path = os.path.join(temp_dir, "concatenated.mp4")
@@ -596,6 +674,9 @@ def handler(job):
     finalize_mode = job_input.get("finalize_mode", False)
     chunk_urls = job_input.get("chunk_urls", [])
 
+    # Intro clips: video clips to prepend before the main image-based video
+    intro_clips = job_input.get("intro_clips", [])
+
     # Handle finalize mode separately (different workflow)
     if finalize_mode:
         print(f"FINALIZE MODE: chunk_urls={len(chunk_urls)}, audio_url={bool(audio_url)}, project_id={project_id}")
@@ -636,7 +717,9 @@ def handler(job):
 
                 output_path = os.path.join(temp_dir, "output_raw.mp4")
                 finalize_video(chunk_urls, audio_url, output_path, temp_dir,
-                              progress_callback=finalize_progress_callback)
+                              progress_callback=finalize_progress_callback,
+                              intro_clips=intro_clips,
+                              apply_effects=apply_effects)
 
                 # Scrub metadata
                 update_render_job(supabase_url, supabase_key, render_job_id,
